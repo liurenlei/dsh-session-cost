@@ -8,6 +8,8 @@
  * stored state and without replaying the session log.
  */
 
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { createPricing, convertToDisplay } from './pricing.js'
 import { applyEvent, buildView, initialState } from './fold.js'
 
@@ -148,6 +150,18 @@ export const Config = Schema === null ? undefined : Schema.object({
     .description('Manual "provider/model" prices per 1M tokens in the display currency; they win over both sources.'),
 })
 
+/**
+ * Last-successful price snapshot under the Harness home. A later offline launch
+ * reads it instead of the built-in DeepSeek table.
+ * @returns absolute cache path.
+ */
+function priceCacheFile() {
+  const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.length > 0
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+  return join(home, 'cache', 'session-cost', 'prices.json')
+}
+
 /** Normalize the validated config to plain settings the fold and view can trust. */
 function settingsOf(config) {
   return {
@@ -172,7 +186,10 @@ function settingsOf(config) {
  */
 export async function apply(ctx, config) {
   const settings = settingsOf(config)
-  const pricing = createPricing(settings, ctx.logger)
+  const pricing = createPricing(settings, ctx.logger, priceCacheFile())
+  // Load before registering so the first projection baseline already prices
+  // from the last snapshot when the machine is offline.
+  pricing.loadCacheSync()
 
   // The wire view is re-derived only when the folded state or a price refresh
   // changes, so unrelated events keep the same reference and publish nothing.

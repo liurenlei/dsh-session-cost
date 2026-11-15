@@ -29,6 +29,12 @@ usage.
 - Both prices are refreshed in the background at startup and every
   `refreshHours`. A failed fetch keeps the previous values; before the first
   successful fetch a built-in copy of the DeepSeek table is used.
+- The last successful snapshot is written to
+  `$DSH_HOME/cache/session-cost/prices.json` (usually
+  `~/.dsh/cache/session-cost/prices.json`). It is loaded before the first fetch,
+  so launching offline still prices from the last real fetch instead of the
+  built-in table. Deleting the file just falls back to the built-in table until
+  the next successful refresh. The file contains public prices only.
 - Manual `overrides` win over everything else.
 
 No session content is sent anywhere: the plugin only downloads the two public
@@ -91,5 +97,6 @@ in DSH changes.
 在输入框下方的 token 统计旁增加一个花费读数（如 `≈¥0.42`），点击可查看按模型的
 明细。DeepSeek 走官方价格（含高峰/空闲，按消息时间区分），其他 provider 走
 models.dev 的 USD 价目表；启动时和每隔 N 小时后台刷新，失败时沿用上次价格。
-手动 `overrides` 优先级最高。金额是估算值，不含账户折扣；法定节假日需要在
-`holidays` 里手动填写。
+最近一次成功的价目表缓存在 `~/.dsh/cache/session-cost/prices.json`，离线启动也能
+按上次的真实价格估算。手动 `overrides` 优先级最高。金额是估算值，不含账户折扣；
+法定节假日需要在 `holidays` 里手动填写。

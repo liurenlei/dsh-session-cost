@@ -8,10 +8,16 @@
  *   `cost` block in USD per one million tokens. It covers every other provider.
  *
  * A built-in DeepSeek table keeps the plugin useful before the first fetch and
- * when the machine is offline. Manual overrides always win.
+ * when the machine is offline. The last successful snapshot is also cached in
+ * the Harness home, so a later offline launch reuses real prices instead of
+ * the built-in table. Manual overrides always win.
  *
  * Prices are stored per one million tokens.
  */
+
+import { readFileSync } from 'node:fs'
+import { mkdir, rename, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
 
 /** DeepSeek's official pricing page as served to the Markdown viewer. */
 export const DEEPSEEK_PRICING_URL = 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing.md'
@@ -199,6 +205,82 @@ function lookupCaseInsensitive(map, key) {
   return undefined
 }
 
+/** Version of the on-disk price snapshot; bump when its shape changes. */
+const CACHE_VERSION = 1
+
+/** Turn the in-memory models.dev index into a JSON-safe object. */
+function serializeModelsDev(map) {
+  if (map === null) return null
+  const providers = {}
+  for (const [providerId, models] of map) {
+    const entries = {}
+    for (const [modelId, price] of models) {
+      entries[modelId] = {
+        input: price.input,
+        output: price.output,
+        cacheRead: price.cacheRead,
+        ...price.cacheWrite === undefined ? {} : { cacheWrite: price.cacheWrite },
+      }
+    }
+    providers[providerId] = entries
+  }
+  return { providers }
+}
+
+/** Rebuild the models.dev index from a cached object, or null when malformed. */
+function deserializeModelsDev(value) {
+  if (value === null || typeof value !== 'object') return null
+  const providers = value.providers
+  if (providers === null || typeof providers !== 'object') return null
+  const map = new Map()
+  for (const [providerId, models] of Object.entries(providers)) {
+    if (models === null || typeof models !== 'object') return null
+    const group = new Map()
+    for (const [modelId, price] of Object.entries(models)) {
+      if (price === null || typeof price !== 'object') return null
+      const input = numberOr(price.input, null)
+      const output = numberOr(price.output, null)
+      if (input === null || output === null) return null
+      group.set(modelId, {
+        input,
+        output,
+        cacheRead: numberOr(price.cacheRead, 0),
+        cacheWrite: numberOr(price.cacheWrite, undefined),
+      })
+    }
+    if (group.size > 0) map.set(providerId, group)
+  }
+  return map.size > 0 ? map : null
+}
+
+/** Validate a cached DeepSeek table, or null when malformed. */
+function validDeepseek(value) {
+  if (value === null || typeof value !== 'object') return null
+  if (value.models === null || typeof value.models !== 'object') return null
+  const models = {}
+  for (const [name, entry] of Object.entries(value.models)) {
+    if (entry === null || typeof entry !== 'object') return null
+    const clean = { idle: ZERO_BUCKETS(), peak: ZERO_BUCKETS() }
+    for (const period of ['idle', 'peak']) {
+      const source = entry[period]
+      if (source === null || typeof source !== 'object') return null
+      for (const key of ['input', 'cacheRead', 'cacheWrite', 'output']) {
+        const rate = numberOr(source[key], null)
+        if (rate === null) return null
+        clean[period][key] = rate
+      }
+    }
+    models[name] = clean
+  }
+  if (Object.keys(models).length === 0) return null
+  return {
+    source: typeof value.source === 'string' ? value.source : 'cached',
+    fetchedAt: numberOr(value.fetchedAt, 0),
+    aliases: value.aliases !== null && typeof value.aliases === 'object' ? value.aliases : {},
+    models,
+  }
+}
+
 /** Convert an amount between the priced currency and the display currency. */
 export function convertToDisplay(amount, from, config) {
   if (from === config.currency) return amount
@@ -212,12 +294,60 @@ export function convertToDisplay(amount, from, config) {
  * route resolution against overrides, DeepSeek, then models.dev.
  * @param {object} config - resolved plugin configuration.
  * @param {{warn: Function}} logger - host logger for refresh failures.
+ * @param {string | undefined} cacheFile - last-successful-snapshot path, or undefined to skip caching.
  */
-export function createPricing(config, logger) {
+export function createPricing(config, logger, cacheFile) {
   let deepseek = DEFAULT_DEEPSEEK
   let modelsDev = null
   let updatedAt = 0
   let generation = 0
+
+  /**
+   * Load the last successful snapshot synchronously, before the projection
+   * registers. An offline launch then prices from the last real fetch instead
+   * of the built-in table.
+   * @returns whether any cached source was usable.
+   */
+  function loadCacheSync() {
+    if (typeof cacheFile !== 'string' || cacheFile.length === 0) return false
+    try {
+      const value = JSON.parse(readFileSync(cacheFile, 'utf8'))
+      if (value === null || typeof value !== 'object' || value.version !== CACHE_VERSION) return false
+      const cachedDeepseek = validDeepseek(value.deepseek)
+      const cachedModels = deserializeModelsDev(value.modelsDev)
+      if (cachedDeepseek === null && cachedModels === null) return false
+      if (cachedDeepseek !== null) deepseek = cachedDeepseek
+      if (cachedModels !== null) modelsDev = cachedModels
+      updatedAt = numberOr(value.savedAt, 0)
+      generation += 1
+      return true
+    } catch (error) {
+      // A missing cache is the normal first-run case; anything else is worth a line.
+      if (error?.code !== 'ENOENT') {
+        logger.warn(`session-cost: price cache could not be read: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      return false
+    }
+  }
+
+  /** Write the current snapshot atomically; a failed write only warns. */
+  async function persist() {
+    if (typeof cacheFile !== 'string' || cacheFile.length === 0) return
+    const payload = JSON.stringify({
+      version: CACHE_VERSION,
+      savedAt: updatedAt > 0 ? updatedAt : Date.now(),
+      deepseek,
+      modelsDev: serializeModelsDev(modelsDev),
+    })
+    try {
+      await mkdir(dirname(cacheFile), { recursive: true })
+      const temporary = `${cacheFile}.${process.pid}.tmp`
+      await writeFile(temporary, payload, { mode: 0o600 })
+      await rename(temporary, cacheFile)
+    } catch (error) {
+      logger.warn(`session-cost: price cache could not be written: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
 
   /** Resolve one provider/model route to prices in their source currency. */
   function resolve(provider, model) {
@@ -320,13 +450,17 @@ export function createPricing(config, logger) {
       logger.warn(`session-cost: models.dev fetch failed: ${String(results[1].reason?.message ?? results[1].reason)}`)
     }
 
-    if (changed) generation += 1
+    if (changed) {
+      generation += 1
+      await persist()
+    }
     return { changed, updatedAt }
   }
 
   return {
     resolve,
     refresh,
+    loadCacheSync,
     get updatedAt() { return updatedAt },
     get generation() { return generation },
   }
