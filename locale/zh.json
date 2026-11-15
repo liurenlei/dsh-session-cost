@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "会话花费",
+    "description": "在输入框下方的 token 统计旁显示当前会话的预估花费，按 DeepSeek 官方高峰/空闲价格与 models.dev 价目表计算，点击可查看按模型的明细。"
+  }
+}

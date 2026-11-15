@@ -1,0 +1,4 @@
+- insert:
+    - id: session-cost
+      name: '@local/dsh-session-cost'
+      config: {}

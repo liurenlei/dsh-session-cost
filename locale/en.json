@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session cost",
+    "description": "Adds a cost reading beside the composer's token statistics, estimated from DeepSeek's official peak/idle prices and the models.dev catalog, with a per-model breakdown."
+  }
+}
